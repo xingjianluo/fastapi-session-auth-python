@@ -32,12 +32,15 @@ class AuthService:
         return self._users
 
     def login(self, username: str, password: str, source: str) -> Session:
-        # 判定顺序：先在锁内原子完成“锁定检查+失败计数”（悲观计数，
-        # 并发失败不丢计数、不超阈放行），再验凭证；
+        # 判定顺序：先在锁内原子完成锁定检查（锁定期间直接拒绝），再验凭证；
+        # 确认失败才原子计数并达阈锁定（并发失败不丢计数、不超阈放行，
+        # 正确口令的并发登录不消耗失败额度）；
         # 成功则清零计数并签发全新会话标识（防固定）。
         self._limiter.begin_attempt(username, source)
         user = self._users.get(username)
         if user is None or not verify_password(password, user.password_hash):
+            # 若并发失败已抢先达阈，此处直接以锁定结论拒绝。
+            self._limiter.record_failure(username, source)
             logger.warning(
                 "登录失败 user=%s source=%s reason=%s",
                 username,
@@ -63,6 +66,31 @@ class AuthService:
         if session_id:
             self._sessions.revoke(session_id)
             logger.info("会话登出并撤销 session=%s", session_id[:8])
+
+    def list_sessions(self, user: User) -> list[Session]:
+        """列出该用户当前仍有效的会话（多端可见性）。"""
+        return self._sessions.list_for_user(user.username)
+
+    def revoke_session(self, user: User, session_id: str) -> None:
+        """撤销属于该用户的指定一条会话，其余会话不受影响。
+
+        会话不存在或不属于该用户时一律按“不存在”处理，
+        不向调用方泄露他人会话是否存在。
+        """
+        target = self._sessions.find(session_id)
+        if target is None or target.username != user.username:
+            logger.warning(
+                "撤销会话失败 user=%s target=%s reason=not_found",
+                user.username,
+                session_id[:8],
+            )
+            raise AuthError(Reason.SESSION_NOT_FOUND, 404, "会话不存在")
+        self._sessions.revoke(session_id)
+        logger.info(
+            "用户撤销指定会话 user=%s session=%s",
+            user.username,
+            session_id[:8],
+        )
 
     def resolve(self, session_id: str | None) -> tuple[Session, User]:
         """解析当前会话与用户实时角色（授权结果不缓存，权限变更立即生效）。"""

@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.deps import (
+    CSRF_HEADER,
     SESSION_COOKIE,
     require_admin_csrf,
     require_auth,
@@ -50,6 +51,7 @@ def _source(request: Request) -> str:
 def create_app(
     *,
     session_ttl: float = 1800.0,
+    session_absolute_ttl: float = 28800.0,
     max_failures: int = 5,
     lock_seconds: float = 60.0,
     clock=None,
@@ -64,7 +66,11 @@ def create_app(
         ("bob", "bob-pass", Role.USER),
     ):
         users.add(User(name, hash_password(password), role))
-    sessions = SessionStore(ttl_seconds=session_ttl, clock=clock)
+    sessions = SessionStore(
+        ttl_seconds=session_ttl,
+        absolute_ttl_seconds=session_absolute_ttl,
+        clock=clock,
+    )
     limiter = RateLimiter(
         max_failures=max_failures,
         lock_seconds=lock_seconds,
@@ -85,10 +91,21 @@ def create_app(
             exc.reason.value,
             exc.detail,
         )
-        return JSONResponse(
+        response = JSONResponse(
             status_code=exc.status_code,
             content={"reason": exc.reason.value, "detail": exc.detail},
         )
+        # 本次请求内若已发生会话轮换（权限变化触发），即使最终以
+        # 403/401 等错误告终，也把新会话标识与新 CSRF 令牌带给客户端：
+        # 被拒的是这次操作，会话本身仍然有效，不应被迫重新登录。
+        rotation = getattr(request.state, "session_rotation", None)
+        if rotation is not None:
+            new_session_id, new_csrf = rotation
+            response.set_cookie(
+                SESSION_COOKIE, new_session_id, httponly=True, samesite="lax"
+            )
+            response.headers[CSRF_HEADER] = new_csrf
+        return response
 
     @app.get("/")
     def read_root() -> dict[str, str]:
@@ -133,6 +150,39 @@ def create_app(
     ):
         session, _ = principal
         return {"csrf_token": session.csrf_token}
+
+    @app.get("/auth/sessions")
+    def list_sessions(
+        principal: tuple[Session, User] = Depends(require_auth),
+    ):
+        # 多端可见性：列出本人当前仍有效的会话，含登录时间、
+        # 最近活动时间与按请求时刻实时判定的权限（不缓存授权结果）。
+        current, user = principal
+        return {
+            "sessions": [
+                {
+                    "session_id": s.session_id,
+                    "created_at": s.created_at,
+                    "last_activity_at": s.last_activity_at,
+                    "expires_at": s.expires_at,
+                    "absolute_expires_at": s.absolute_expires_at,
+                    "role": user.role.value,
+                    "current": s.session_id == current.session_id,
+                }
+                for s in service.list_sessions(user)
+            ]
+        }
+
+    @app.delete("/auth/sessions/{session_id}")
+    def revoke_session(
+        session_id: str,
+        principal: tuple[Session, User] = Depends(require_csrf),
+    ):
+        # 单条撤销：仅影响指定的那一条，其余会话照常可用；
+        # 被撤销的标识立墓碑，复用返回 401 session_revoked（与自然过期可区分）。
+        _, user = principal
+        service.revoke_session(user, session_id)
+        return {"detail": "已撤销", "session_id": session_id}
 
     @app.get("/admin/users")
     def admin_users(

@@ -13,6 +13,7 @@ class Reason(str, enum.Enum):
     UNAUTHENTICATED = "unauthenticated"
     SESSION_EXPIRED = "session_expired"
     SESSION_REVOKED = "session_revoked"
+    SESSION_NOT_FOUND = "session_not_found"
     FORBIDDEN = "forbidden"
     CSRF_MISSING = "csrf_missing"
     CSRF_INVALID = "csrf_invalid"

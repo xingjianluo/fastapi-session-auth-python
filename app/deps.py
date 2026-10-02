@@ -17,6 +17,10 @@ SESSION_COOKIE = "session"
 CSRF_HEADER = "x-csrf-token"
 # 轮换当次请求临时携带的"上一代令牌"，仅在本次请求内有效。
 _PRED_STATE = "csrf_predecessor_token"
+# 本次请求内发生的会话轮换结果（新标识、新 CSRF 令牌）：
+# 即使后续判定（如角色不足）以错误响应告终，也要把新标识带给客户端，
+# 避免“被拒一次操作”把本来仍然有效的会话弄丢。
+_ROTATION_STATE = "session_rotation"
 
 logger = logging.getLogger("auth.deps")
 
@@ -37,6 +41,11 @@ def require_auth(
         old_csrf = session.csrf_token
         session = service.rotate(session, user)
         setattr(request.state, _PRED_STATE, old_csrf)
+        setattr(
+            request.state,
+            _ROTATION_STATE,
+            (session.session_id, session.csrf_token),
+        )
         response.set_cookie(
             SESSION_COOKIE,
             session.session_id,
