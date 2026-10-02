@@ -32,21 +32,29 @@ class AuthService:
         return self._users
 
     def login(self, username: str, password: str, source: str) -> Session:
-        # 判定顺序：先在锁内原子完成“锁定检查+失败计数”（悲观计数，
-        # 并发失败不丢计数、不超阈放行），再验凭证；
-        # 成功则清零计数并签发全新会话标识（防固定）。
+        # 判定顺序不变：先锁定检查（账号优先于来源），再验凭证。
+        # 并发名额保证“进行中+已确认失败”不超阈值；失败只在凭证确认
+        # 错误后计入，因此并发正确登录只会排队，不会被误伤。
         self._limiter.begin_attempt(username, source)
-        user = self._users.get(username)
-        if user is None or not verify_password(password, user.password_hash):
-            logger.warning(
-                "登录失败 user=%s source=%s reason=%s",
-                username,
-                source,
-                Reason.INVALID_CREDENTIALS.value,
-            )
-            raise AuthError(
-                Reason.INVALID_CREDENTIALS, 401, "用户名或口令错误"
-            )
+        try:
+            user = self._users.get(username)
+            if user is None or not verify_password(password, user.password_hash):
+                self._limiter.record_failure(username, source)
+                logger.warning(
+                    "登录失败 user=%s source=%s reason=%s",
+                    username,
+                    source,
+                    Reason.INVALID_CREDENTIALS.value,
+                )
+                raise AuthError(
+                    Reason.INVALID_CREDENTIALS, 401, "用户名或口令错误"
+                )
+        except AuthError:
+            raise
+        except Exception:
+            # 未走到成功/失败结论时归还名额，避免并发名额泄漏。
+            self._limiter.release_slots(username, source)
+            raise
         self._limiter.record_success(username, source)
         session = self._sessions.create(user.username, user.role_version)
         logger.info(
@@ -63,6 +71,46 @@ class AuthService:
         if session_id:
             self._sessions.revoke(session_id)
             logger.info("会话登出并撤销 session=%s", session_id[:8])
+
+    def touch(self, session: Session) -> Session:
+        """受保护访问后续期（滑动空闲截止，不越过绝对上限）。"""
+        renewed = self._sessions.touch(session.session_id)
+        logger.debug(
+            "会话续期 session=%s idle_until=%s absolute_until=%s",
+            renewed.session_id[:8],
+            renewed.expires_at,
+            renewed.absolute_expires_at,
+        )
+        return renewed
+
+    def list_sessions(self, user: User) -> list[tuple[Session, User]]:
+        """列出本人当前有效会话，并附带该会话按当前用户记录看到的角色。
+
+        授权结果不缓存：列表中每条展示的都是用户当前角色，
+        因此权限调整后无需等待即按新角色显示。
+        """
+        sessions = self._sessions.list_for_user(user.username)
+        logger.info(
+            "列出有效会话 user=%s count=%s", user.username, len(sessions)
+        )
+        return [(session, user) for session in sessions]
+
+    def revoke_session(self, user: User, session_id: str) -> None:
+        """撤销本人名下指定的单条会话；不属于本人则按不存在处理。"""
+        if not self._sessions.revoke_one(user.username, session_id):
+            logger.warning(
+                "单条撤销未命中 user=%s session=%s",
+                user.username,
+                session_id[:8] if session_id else "-",
+            )
+            raise AuthError(
+                Reason.UNAUTHENTICATED, 404, "会话不存在或不属于当前账号"
+            )
+        logger.info(
+            "单条会话已撤销 user=%s session=%s",
+            user.username,
+            session_id[:8],
+        )
 
     def resolve(self, session_id: str | None) -> tuple[Session, User]:
         """解析当前会话与用户实时角色（授权结果不缓存，权限变更立即生效）。"""

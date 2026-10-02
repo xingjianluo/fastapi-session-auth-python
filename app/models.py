@@ -25,6 +25,11 @@ class Session:
     username: str
     csrf_token: str
     created_at: float
+    # 空闲截止：每次受保护访问向后滑动（续期），不操作则自然到期。
     expires_at: float
+    # 绝对截止：自本次登录（会话沿袭链起点）算起的硬上限，续期不得越过。
+    absolute_expires_at: float = 0.0
+    # 最近一次受保护活动时间（用于多端会话列表展示）。
+    last_seen_at: float = 0.0
     # 创建/最近一次轮换时观察到的角色版本号。
     role_version: int = 0

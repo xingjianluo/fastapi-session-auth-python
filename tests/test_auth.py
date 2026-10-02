@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-import pytest
 from fastapi.testclient import TestClient
 
 from main import create_app

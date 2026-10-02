@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.deps import (
+    _PENDING_COOKIE_STATE,
+    CSRF_HEADER,
     SESSION_COOKIE,
     require_admin_csrf,
     require_auth,
@@ -43,6 +45,10 @@ class RevokeBody(BaseModel):
     username: str
 
 
+class SessionRevokeBody(BaseModel):
+    session_id: str
+
+
 def _source(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
@@ -50,6 +56,7 @@ def _source(request: Request) -> str:
 def create_app(
     *,
     session_ttl: float = 1800.0,
+    absolute_session_ttl: float = 14400.0,
     max_failures: int = 5,
     lock_seconds: float = 60.0,
     clock=None,
@@ -64,7 +71,11 @@ def create_app(
         ("bob", "bob-pass", Role.USER),
     ):
         users.add(User(name, hash_password(password), role))
-    sessions = SessionStore(ttl_seconds=session_ttl, clock=clock)
+    sessions = SessionStore(
+        ttl_seconds=session_ttl,
+        absolute_ttl_seconds=absolute_session_ttl,
+        clock=clock,
+    )
     limiter = RateLimiter(
         max_failures=max_failures,
         lock_seconds=lock_seconds,
@@ -85,10 +96,24 @@ def create_app(
             exc.reason.value,
             exc.detail,
         )
-        return JSONResponse(
+        response = JSONResponse(
             status_code=exc.status_code,
             content={"reason": exc.reason.value, "detail": exc.detail},
         )
+        # 权限变化引发的轮换可能发生在随后被 403 拒绝的请求里；
+        # 错误响应也必须下发新标识，否则客户端持旧标识会被当成已撤销，
+        # 等同于一次越权被拒就把整条会话踢掉。
+        pending = getattr(request.state, _PENDING_COOKIE_STATE, None)
+        if pending is not None:
+            new_session_id, new_csrf = pending
+            response.set_cookie(
+                SESSION_COOKIE,
+                new_session_id,
+                httponly=True,
+                samesite="lax",
+            )
+            response.headers[CSRF_HEADER] = new_csrf
+        return response
 
     @app.get("/")
     def read_root() -> dict[str, str]:
@@ -133,6 +158,65 @@ def create_app(
     ):
         session, _ = principal
         return {"csrf_token": session.csrf_token}
+
+    @app.get("/auth/sessions")
+    def list_sessions(
+        principal: tuple[Session, User] = Depends(require_auth),
+    ):
+        """列出本人当前有效会话（手机/平板/电脑等多端）。
+
+        仅返回本人名下会话；每条展示登录时间、最近活动时间与该会话
+        当前看到的角色（按用户实时记录，权限调整后立即体现）。
+        """
+        _, user = principal
+        now = clock()
+        items = []
+        for session, owner in service.list_sessions(user):
+            items.append(
+                {
+                    "session_id": session.session_id,
+                    "current": session.session_id
+                    == principal[0].session_id,
+                    "created_at": session.created_at,
+                    "last_seen_at": session.last_seen_at,
+                    "idle_expires_at": session.expires_at,
+                    "absolute_expires_at": session.absolute_expires_at,
+                    "role": owner.role.value,
+                    "age_seconds": now - session.created_at,
+                    "idle_seconds_remaining": max(
+                        0.0, session.expires_at - now
+                    ),
+                }
+            )
+        items.sort(key=lambda item: item["created_at"])
+        logger.info("会话列表 user=%s 返回 %s 条", user.username, len(items))
+        return {"username": user.username, "sessions": items}
+
+    @app.post("/auth/sessions/revoke")
+    def revoke_session(
+        body: SessionRevokeBody,
+        principal: tuple[Session, User] = Depends(require_csrf),
+    ):
+        """撤销本人名下指定的单条会话，其余会话不受影响。
+
+        被撤销的标识此后一律返回 401 session_revoked，与自然过期区分。
+        撤销的若是当前会话，则本次响应同时清除自身 Cookie。
+        """
+        session, user = principal
+        target = body.session_id
+        service.revoke_session(user, target)
+        response = JSONResponse(
+            {"detail": "会话已撤销", "session_id": target}
+        )
+        if target == session.session_id:
+            response.delete_cookie(SESSION_COOKIE)
+        logger.info(
+            "单条撤销完成 user=%s target=%s self=%s",
+            user.username,
+            target[:8],
+            target == session.session_id,
+        )
+        return response
 
     @app.get("/admin/users")
     def admin_users(

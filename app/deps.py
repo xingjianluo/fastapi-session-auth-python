@@ -1,7 +1,8 @@
 """FastAPI 依赖：认证、角色授权、CSRF 校验。
 
-判定顺序：会话解析（未认证/过期/撤销）→ 权限变化时原子轮换会话标识
-→ 状态变更请求的 CSRF 校验 → 角色判定（默认拒绝）。
+判定顺序：会话解析（未认证/过期/撤销）→ 滑动续期
+→ 权限变化时原子轮换会话标识 → 状态变更请求的 CSRF 校验
+→ 角色判定（默认拒绝）。
 """
 from __future__ import annotations
 
@@ -17,6 +18,8 @@ SESSION_COOKIE = "session"
 CSRF_HEADER = "x-csrf-token"
 # 轮换当次请求临时携带的"上一代令牌"，仅在本次请求内有效。
 _PRED_STATE = "csrf_predecessor_token"
+# 轮换当次请求待下发的新会话标识（即使随后 403/其他错误也要随响应下发）。
+_PENDING_COOKIE_STATE = "pending_session_cookie"
 
 logger = logging.getLogger("auth.deps")
 
@@ -31,12 +34,22 @@ def require_auth(
     service: AuthService = Depends(get_service),
 ) -> tuple[Session, User]:
     session, user = service.resolve(request.cookies.get(SESSION_COOKIE))
+    # 持续活动滑动续期：原子“校验+滑动”，同一会话并发访问不会算错到期。
+    # 无论随后授权是否通过，这条请求已证明会话在活动，都完成续期。
+    session = service.touch(session)
     if service.needs_rotation(session, user):
         # 权限已变化：原子轮换会话标识，旧标识立即失效；
         # 新标识与新 CSRF 令牌随响应下发，上一代令牌仅本次请求可沿用。
+        # 待下发标识同时暂存 request.state：即使随后被 403 拒绝，错误响应
+        # 也由错误处理器补发新 Cookie——被拒不等于会话失效，后续请求仍可用。
         old_csrf = session.csrf_token
         session = service.rotate(session, user)
         setattr(request.state, _PRED_STATE, old_csrf)
+        setattr(
+            request.state,
+            _PENDING_COOKIE_STATE,
+            (session.session_id, session.csrf_token),
+        )
         response.set_cookie(
             SESSION_COOKIE,
             session.session_id,
